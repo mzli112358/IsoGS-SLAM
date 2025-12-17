@@ -113,7 +113,7 @@ def report_loss(losses, wandb_run, wandb_step, tracking=False, mapping=False):
             wandb_run.log(frame_opt_loss_dict)
     
     # [IsoGS] Print to terminal regardless of wandb status (with frequency control)
-    if wandb_step % 10 == 0:
+    if wandb_step % 60 == 0:
         stage = "Tracking" if tracking else ("Mapping" if mapping else "Optimization")
         flat_val = losses.get('flat', torch.tensor(0.0))
         if isinstance(flat_val, torch.Tensor):

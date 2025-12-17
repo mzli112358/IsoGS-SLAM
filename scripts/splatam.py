@@ -323,7 +323,7 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
             get_loss._debug_call_count = 0
         get_loss._debug_call_count += 1
         if get_loss._debug_call_count % 60 == 0:
-            print(f"[IsoGS Debug] Scales - Mean Min: {loss_flat.item():.6f} | Mean Max: {mean_max_scale.item():.6f} | Ratio: {mean_max_scale.item()/loss_flat.item():.2f}x")
+            print(f"[IsoGS Debug] Scales - Mean Min: {loss_flat.item():.6f} | Mean Max: {mean_max_scale.item():.6f} | Ratio: {mean_max_scale.item()/loss_flat.item():.1f}x")
     elif scales.shape[1] == 1:  # Isotropic (1D)
         # Skip flatness loss for isotropic Gaussians
         losses['flat'] = torch.tensor(0.0, device=scales.device, dtype=scales.dtype)
@@ -502,14 +502,14 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
         # plt.close()
 
     # [IsoGS] Ensure flatness loss weight exists with default value
-    # Increased from 0.01 to 20.0 to match the scale of RGB Loss (~5e-3)
+    # Increased from 0.01 to 100.0 to match the scale of RGB Loss (~5e-3)
     # Current Flat Loss ~5e-5, so weight needs to be ~1000x to have comparable influence
     if 'flat' not in loss_weights:
-        loss_weights['flat'] = 20.0
+        loss_weights['flat'] = 100.0
     
     # [IsoGS] Ensure iso-surface density loss weight exists with default value
     if 'iso' not in loss_weights:
-        loss_weights['iso'] = 5.0
+        loss_weights['iso'] = 2.0
 
     # [IsoGS] Filter out monitoring metrics (like 'mean_density') from loss computation
     # Only compute weighted losses for actual loss terms

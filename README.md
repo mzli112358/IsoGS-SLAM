@@ -40,6 +40,7 @@
 - [核心算法](#核心算法)
 - [项目结构](#项目结构)
 - [实验与评估](#实验与评估)
+- [网格提取指南](#网格提取指南)
 - [基线对比](#基线对比)
 - [开发路线图](#开发路线图)
 - [引用](#引用)
@@ -192,13 +193,26 @@ python viz_scripts/final_recon.py configs/replica/isogs_slam.py
 
 ### 导出Mesh
 
-```bash
-# 导出PLY格式的网格
-python scripts/export_mesh.py configs/replica/isogs_slam.py --format ply
+从训练好的 checkpoint 中提取网格：
 
-# 导出OBJ格式的网格
-python scripts/export_mesh.py configs/replica/isogs_slam.py --format obj
+```bash
+# 基本使用（自动查找最新checkpoint）
+python scripts/extract_mesh_isogs.py configs/replica/splatam.py
+
+# 指定checkpoint和输出路径
+python scripts/extract_mesh_isogs.py configs/replica/splatam.py \
+    --checkpoint params100.npz \
+    --output mesh.ply
+
+# 高质量网格（更小的体素）
+python scripts/extract_mesh_isogs.py configs/replica/splatam.py \
+    --voxel-size 0.01 \
+    --iso-level 1.0
 ```
+
+📖 **详细使用指南**：请参阅 [网格提取完整指南](docs/MESH_EXTRACTION_GUIDE.md)
+
+> **注意**：`scripts/export_ply.py` 用于导出高斯点云，而 `extract_mesh_isogs.py` 用于提取网格面片。
 
 ---
 
@@ -296,6 +310,41 @@ IsoGS-SLAM/
 - **渲染质量**: 与SplaTAM持平或略低（为几何质量做出轻微牺牲）
 - **几何质量**: Mesh精度显著优于原始3DGS，接近TSDF Fusion效果
 - **实时性能**: 关键帧优化时30+ FPS，跟踪线程100+ FPS
+
+---
+
+## 网格提取指南
+
+训练完成后，可以使用 `extract_mesh_isogs.py` 脚本从 checkpoint 中提取 3D 网格。
+
+### 快速开始
+
+```bash
+# 使用默认参数提取网格
+python scripts/extract_mesh_isogs.py configs/replica/splatam.py
+```
+
+提取的网格会保存在结果目录下的 `mesh.ply` 文件中。
+
+### 主要参数
+
+- `--voxel-size`: 体素大小（默认 0.02 米），更小的值产生更精细的网格
+- `--iso-level`: 等值面阈值（默认 1.0），根据训练日志中的 Mean Density 调整
+- `--chunk-size`: 批处理大小（默认 64），显存不足时可减小
+- `--checkpoint`: 指定 checkpoint 文件，默认为最新
+
+### 详细文档
+
+完整的使用指南、参数说明、常见问题等，请参阅：
+
+📖 **[网格提取完整指南](docs/MESH_EXTRACTION_GUIDE.md)**
+
+该指南包含：
+- 详细参数说明和推荐值
+- 多个使用示例
+- 算法原理解释
+- 常见问题解决方案
+- 性能参考
 
 ---
 
