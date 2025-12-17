@@ -502,7 +502,7 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
         # plt.close()
 
     # [IsoGS] Ensure flatness loss weight exists with default value
-    # Increased from 0.01 to 100.0 to match the scale of RGB Loss (~5e-3)
+    # Increased from 0.01 to 50.0 to match the scale of RGB Loss (~5e-3)
     # Current Flat Loss ~5e-5, so weight needs to be ~1000x to have comparable influence
     if 'flat' not in loss_weights:
         loss_weights['flat'] = 50.0
