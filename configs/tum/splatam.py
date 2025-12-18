@@ -12,7 +12,7 @@ map_every = 1
 keyframe_every = 5
 mapping_window_size = 20
 tracking_iters = 200
-mapping_iters = 30
+mapping_iters = 40
 scene_radius_depth_ratio = 2
 
 group_name = "TUM"

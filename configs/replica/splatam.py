@@ -7,13 +7,13 @@ scenes = ["room0", "room1", "room2",
 
 primary_device="cuda:0"
 seed = 0
-scene_name = scenes[1]
+scene_name = scenes[2]
 
-map_every = 1
+map_every = 5
 keyframe_every = 5
 mapping_window_size = 24
-tracking_iters = 40
-mapping_iters = 30
+tracking_iters = 10
+mapping_iters = 40
 
 group_name = "Replica"
 run_name = f"{scene_name}_{seed}"
@@ -32,8 +32,10 @@ config = dict(
     mean_sq_dist_method="projective", # ["projective", "knn"] (Type of Mean Squared Distance Calculation for Scale of Gaussians)
     gaussian_distribution="isotropic", # ["isotropic", "anisotropic"] (Isotropic -> Spherical Covariance, Anisotropic -> Ellipsoidal Covariance)
     report_iter_progress=False,
-    load_checkpoint=False,
-    checkpoint_time_idx=0,
+    # 加载检查点：默认自动从当前 run 目录下「最新的 params*.npz」继续
+    # checkpoint_time_idx < 0 表示自动选择最新帧；=0 表示从头开始
+    load_checkpoint=True,
+    checkpoint_time_idx=-1,
     save_checkpoints=True, # Save Checkpoints
     checkpoint_interval=50, # Checkpoint Interval
     use_wandb=False,

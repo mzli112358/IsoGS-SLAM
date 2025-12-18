@@ -19,11 +19,6 @@ python scripts/export_ply.py configs/replica/splatam.py
 
 
 
-python scripts/extract_mesh_fast.py configs/replica/splatam.py --iso-level 0.1 --output mesh_iso0.1.ply --no-cleaning
-
-python scripts/extract_mesh_fast.py configs/replica/splatam.py --iso-level 0.1 --output mesh_iso0.1.ply --no-cleaning
-
-
 python scripts/extract_mesh_fast.py configs/replica/splatam.py \
   --checkpoint /home/pw_is_6/IsoGS-SLAM/SplaTAM/experiments/Replica/splatam_output/room0_0/params.npz \
   --iso-level 0.8 \
@@ -38,4 +33,15 @@ python scripts/extract_mesh_fast.py configs/replica/splatam.py \
     --voxel-size 0.01 \
     --iso-level 0.3 \
     --no-cleaning \
-    --output mesh_thickened.ply
+    --output mesh_thickened_1350.ply
+
+
+
+conda activate isogs
+cd /home/pw_is_6/IsoGS-SLAM/SplaTAM
+python viz_scripts/final_recon.py experiments/Replica/room1_0/params850.npz
+
+
+conda activate isogs
+cd /home/pw_is_6/IsoGS-SLAM/SplaTAM
+python viz_scripts/online_recon.py experiments/Replica/room1_0/params850.npz

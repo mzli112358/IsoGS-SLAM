@@ -13,7 +13,7 @@ map_every = 1
 keyframe_every = 5
 mapping_window_size = 10
 tracking_iters = 100
-mapping_iters = 30
+mapping_iters = 40
 scene_radius_depth_ratio = 3
 
 group_name = "ScanNet"

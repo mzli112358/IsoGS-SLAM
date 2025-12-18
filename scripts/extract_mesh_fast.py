@@ -297,45 +297,61 @@ def compute_density_tiled(voxel_coords, dims, means, inverse_covariances, opacit
                 relevant_opacities = opacities[relevant_indices]  # [K]
                 relevant_max_truncate = max_truncate_dist[relevant_indices]  # [K]
                 
-                # Compute density for block voxels
-                # block_voxel_coords_flat: [B, 3]
-                # relevant_means: [K, 3]
+                # Internal voxel batching to prevent OOM
+                voxel_batch_size = 512
+                num_relevant_gaussians = len(relevant_indices)
                 
-                # Compute distances: [B, K, 3]
-                deltas = block_voxel_coords_flat.unsqueeze(1) - relevant_means.unsqueeze(0)  # [B, K, 3]
-                dists = torch.norm(deltas, dim=2)  # [B, K]
+                # Initialize block densities
+                block_densities = torch.zeros(num_block_voxels, device=device, dtype=torch.float32)
                 
-                # Apply truncation mask: [B, K]
-                truncate_mask = dists < relevant_max_truncate.unsqueeze(0)  # [B, K]
-                
-                # Compute quadratic form: delta^T @ inv_cov @ delta
-                # deltas: [B, K, 3] -> [B*K, 3]
-                deltas_flat = deltas.reshape(-1, 3)  # [B*K, 3]
-                
-                # relevant_inv_covs: [K, 3, 3] -> [B, K, 3, 3]
-                inv_covs_expanded = relevant_inv_covs.unsqueeze(0).expand(num_block_voxels, -1, -1, -1)
-                inv_covs_flat = inv_covs_expanded.reshape(-1, 3, 3)  # [B*K, 3, 3]
-                
-                # Compute quadratic form
-                deltas_flat_expanded = deltas_flat.unsqueeze(1)  # [B*K, 1, 3]
-                inv_cov_delta = torch.bmm(deltas_flat_expanded, inv_covs_flat)  # [B*K, 1, 3]
-                quad_form_flat = torch.bmm(inv_cov_delta, deltas_flat.unsqueeze(-1)).squeeze(-1).squeeze(-1)  # [B*K]
-                
-                # Reshape back: [B*K] -> [B, K]
-                quad_form = quad_form_flat.reshape(num_block_voxels, len(relevant_indices))
-                
-                # Compute exponential
-                exp_term = torch.exp(-0.5 * quad_form)  # [B, K]
-                
-                # Multiply by opacities
-                relevant_opacities_expanded = relevant_opacities.unsqueeze(0).expand(num_block_voxels, -1)  # [B, K]
-                density_contrib = relevant_opacities_expanded * exp_term  # [B, K]
-                
-                # Apply truncation mask
-                density_contrib = density_contrib * truncate_mask.float()
-                
-                # Sum over Gaussians: [B, K] -> [B]
-                block_densities = density_contrib.sum(dim=1)  # [B]
+                # Process voxels in batches
+                for i in range(0, num_block_voxels, voxel_batch_size):
+                    batch_end = min(i + voxel_batch_size, num_block_voxels)
+                    batch_voxels = block_voxel_coords_flat[i:batch_end]  # [batch_size, 3]
+                    batch_size = len(batch_voxels)
+                    
+                    # Compute density for batch voxels
+                    # batch_voxels: [batch_size, 3]
+                    # relevant_means: [K, 3]
+                    
+                    # Compute distances: [batch_size, K, 3]
+                    deltas = batch_voxels.unsqueeze(1) - relevant_means.unsqueeze(0)  # [batch_size, K, 3]
+                    dists = torch.norm(deltas, dim=2)  # [batch_size, K]
+                    
+                    # Apply truncation mask: [batch_size, K]
+                    truncate_mask = dists < relevant_max_truncate.unsqueeze(0)  # [batch_size, K]
+                    
+                    # Compute quadratic form: delta^T @ inv_cov @ delta
+                    # deltas: [batch_size, K, 3] -> [batch_size*K, 3]
+                    deltas_flat = deltas.reshape(-1, 3)  # [batch_size*K, 3]
+                    
+                    # relevant_inv_covs: [K, 3, 3] -> [batch_size, K, 3, 3]
+                    inv_covs_expanded = relevant_inv_covs.unsqueeze(0).expand(batch_size, -1, -1, -1)
+                    inv_covs_flat = inv_covs_expanded.reshape(-1, 3, 3)  # [batch_size*K, 3, 3]
+                    
+                    # Compute quadratic form
+                    deltas_flat_expanded = deltas_flat.unsqueeze(1)  # [batch_size*K, 1, 3]
+                    inv_cov_delta = torch.bmm(deltas_flat_expanded, inv_covs_flat)  # [batch_size*K, 1, 3]
+                    quad_form_flat = torch.bmm(inv_cov_delta, deltas_flat.unsqueeze(-1)).squeeze(-1).squeeze(-1)  # [batch_size*K]
+                    
+                    # Reshape back: [batch_size*K] -> [batch_size, K]
+                    quad_form = quad_form_flat.reshape(batch_size, num_relevant_gaussians)
+                    
+                    # Compute exponential
+                    exp_term = torch.exp(-0.5 * quad_form)  # [batch_size, K]
+                    
+                    # Multiply by opacities
+                    relevant_opacities_expanded = relevant_opacities.unsqueeze(0).expand(batch_size, -1)  # [batch_size, K]
+                    density_contrib = relevant_opacities_expanded * exp_term  # [batch_size, K]
+                    
+                    # Apply truncation mask
+                    density_contrib = density_contrib * truncate_mask.float()
+                    
+                    # Sum over Gaussians: [batch_size, K] -> [batch_size]
+                    batch_densities = density_contrib.sum(dim=1)  # [batch_size]
+                    
+                    # Store batch densities in the corresponding positions
+                    block_densities[i:batch_end] = batch_densities
                 
                 # Map block densities back to global voxel indices
                 # Calculate global linear indices for this block

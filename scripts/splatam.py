@@ -36,6 +36,130 @@ from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, dens
 
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 
+# [IsoGS] Core computation functions for geometric constraints (extracted for optimization)
+def compute_flat_loss(scales):
+    """
+    Compute flatness loss from Gaussian scales.
+    
+    Args:
+        scales: [N, 3] tensor of Gaussian scales
+    
+    Returns:
+        loss_flat: scalar tensor
+    """
+    # Compute the minimum axis (smallest scale) for each Gaussian and take mean
+    loss_flat = torch.mean(torch.min(scales, dim=1).values)
+    return loss_flat
+
+
+def compute_iso_surface_loss_sampled(
+    query_points,  # [sample_size, 3]
+    means,  # [N, 3]
+    inverse_covariances,  # [N, 3, 3]
+    opacities,  # [N, 1]
+    K,  # int
+    target_saturation,  # float
+    chunk_size=64,  # int: internal batch size to avoid OOM
+):
+    """
+    Compute iso-surface density loss using sampled query points with internal batching.
+    
+    This function performs KNN search and density computation for sampled points only.
+    Uses internal chunking to avoid OOM when dealing with large numbers of Gaussians.
+    
+    Args:
+        query_points: [sample_size, 3] sampled query points
+        means: [N, 3] all Gaussian means
+        inverse_covariances: [N, 3, 3] all inverse covariance matrices
+        opacities: [N, 1] all Gaussian opacities
+        K: number of nearest neighbors
+        target_saturation: target density value
+        chunk_size: internal batch size for processing query points (default: 1024)
+    
+    Returns:
+        loss_iso: scalar tensor
+        density_val: [sample_size] density values for monitoring
+    """
+    sample_size = query_points.shape[0]
+    num_gaussians = means.shape[0]
+    
+    # [IsoGS] Internal batching: process query_points in chunks to avoid OOM
+    # Accumulate density values and loss contributions across chunks
+    all_density_vals = []
+    all_loss_contributions = []
+    
+    num_chunks = (sample_size + chunk_size - 1) // chunk_size  # Ceiling division
+    
+    for chunk_idx in range(num_chunks):
+        start_idx = chunk_idx * chunk_size
+        end_idx = min(start_idx + chunk_size, sample_size)
+        chunk_query_points = query_points[start_idx:end_idx]  # [chunk_size, 3]
+        chunk_size_actual = chunk_query_points.shape[0]
+        
+        # KNN search using torch.cdist for this chunk
+        # Compute distance matrix: [chunk_size_actual, N]
+        chunk_distances = torch.cdist(chunk_query_points, means)  # [chunk_size_actual, num_gaussians]
+        # Find K nearest neighbors
+        _, chunk_neighbor_indices = torch.topk(chunk_distances, k=min(K, num_gaussians), dim=1, largest=False)  # [chunk_size_actual, K]
+        
+        # Collect neighbor data for this chunk
+        # Expand chunk_query_points for broadcasting: [chunk_size_actual, 1, 3]
+        chunk_query_points_expanded = chunk_query_points.unsqueeze(1)  # [chunk_size_actual, 1, 3]
+        
+        # Gather neighbor means: [chunk_size_actual, K, 3]
+        chunk_neighbor_means = means[chunk_neighbor_indices]  # [chunk_size_actual, K, 3]
+        
+        # Compute delta vectors: [chunk_size_actual, K, 3]
+        chunk_deltas = chunk_query_points_expanded - chunk_neighbor_means  # [chunk_size_actual, K, 3]
+        
+        # Gather neighbor inverse covariances: [chunk_size_actual, K, 3, 3]
+        chunk_neighbor_inv_covs = inverse_covariances[chunk_neighbor_indices]  # [chunk_size_actual, K, 3, 3]
+        
+        # Gather neighbor opacities: [chunk_size_actual, K, 1]
+        chunk_neighbor_opacities = opacities[chunk_neighbor_indices]  # [chunk_size_actual, K, 1]
+        
+        # Compute density: D = sum(α_j * exp(-0.5 * Δ^T * Σ_j^{-1} * Δ))
+        # Reshape for batch matrix multiplication
+        chunk_deltas_reshaped = chunk_deltas.unsqueeze(-1)  # [chunk_size_actual, K, 3, 1]
+        
+        # Compute inv_cov @ delta: [chunk_size_actual, K, 3, 3] @ [chunk_size_actual, K, 3, 1] = [chunk_size_actual, K, 3, 1]
+        chunk_inv_cov_delta = torch.matmul(chunk_neighbor_inv_covs, chunk_deltas_reshaped)  # [chunk_size_actual, K, 3, 1]
+        
+        # Compute delta^T @ (inv_cov @ delta): [chunk_size_actual, K, 1, 3] @ [chunk_size_actual, K, 3, 1] = [chunk_size_actual, K, 1, 1]
+        chunk_deltas_T = chunk_deltas.unsqueeze(-2)  # [chunk_size_actual, K, 1, 3]
+        chunk_quad_form = torch.matmul(chunk_deltas_T, chunk_inv_cov_delta).squeeze(-1).squeeze(-1)  # [chunk_size_actual, K]
+        
+        # Compute exponential: exp(-0.5 * quad_form)
+        chunk_exp_term = torch.exp(-0.5 * chunk_quad_form)  # [chunk_size_actual, K]
+        
+        # Multiply by opacities and sum over neighbors
+        chunk_neighbor_opacities_squeezed = chunk_neighbor_opacities.squeeze(-1)  # [chunk_size_actual, K]
+        chunk_density_per_neighbor = chunk_neighbor_opacities_squeezed * chunk_exp_term  # [chunk_size_actual, K]
+        chunk_density_sum = chunk_density_per_neighbor.sum(dim=1)  # [chunk_size_actual]
+        
+        # Store density values for this chunk
+        all_density_vals.append(chunk_density_sum)
+        
+        # Compute loss contribution for this chunk
+        chunk_loss_contribution = (chunk_density_sum - target_saturation) ** 2
+        all_loss_contributions.append(chunk_loss_contribution)
+    
+    # Concatenate all density values
+    density_val = torch.cat(all_density_vals, dim=0)  # [sample_size]
+    
+    # Compute overall loss as mean of all contributions
+    loss_iso = torch.mean(torch.cat(all_loss_contributions, dim=0))
+
+    # [IsoGS] Explicitly free large temporary tensors and reclaim fragmented memory
+    if "chunk_distances" in locals():
+        del chunk_distances
+    torch.cuda.empty_cache()
+
+    return loss_iso, density_val
+
+
+    # [IsoGS] Use pure Python implementations directly (no torch.compile)
+
 
 def get_dataset(config_dict, basedir, sequence, **kwargs):
     if config_dict["dataset_name"].lower() in ["icl"]:
@@ -300,159 +424,115 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     else:
         losses['im'] = 0.8 * l1_loss_v1(im, curr_data['im']) + 0.2 * (1.0 - calc_ssim(im, curr_data['im']))
 
-    # [IsoGS] Added Flatness Constraint
-    # Get scales from log_scales
-    scales = torch.exp(params['log_scales'])
-    # [IsoGS] Clamp scales to prevent numerical underflow
-    scales = torch.clamp(scales, min=1e-5)
-    
-    # [IsoGS] Debug: Print scales shape (only once)
-    if not hasattr(get_loss, '_debug_printed'):
-        print(f"[IsoGS DEBUG] Scales shape: {scales.shape}, Gaussian distribution type: {'Isotropic' if scales.shape[1] == 1 else 'Anisotropic'}")
-        get_loss._debug_printed = True
-    
-    # Check dimensions and compute flatness loss
-    if scales.shape[1] == 3:  # Anisotropic (3D)
-        # Compute the minimum axis (smallest scale) for each Gaussian and take mean
-        loss_flat = torch.mean(torch.min(scales, dim=1).values)
-        losses['flat'] = loss_flat
-        # [IsoGS] Compute mean max scale for monitoring
-        mean_max_scale = torch.mean(torch.max(scales, dim=1).values)
-        # [IsoGS] Debug print with frequency control (every 60 calls)
-        if not hasattr(get_loss, '_debug_call_count'):
-            get_loss._debug_call_count = 0
-        get_loss._debug_call_count += 1
-        if get_loss._debug_call_count % 60 == 0:
-            print(f"[IsoGS Debug] Scales - Mean Min: {loss_flat.item():.6f} | Mean Max: {mean_max_scale.item():.6f} | Ratio: {mean_max_scale.item()/loss_flat.item():.1f}x")
-    elif scales.shape[1] == 1:  # Isotropic (1D)
-        # Skip flatness loss for isotropic Gaussians
-        losses['flat'] = torch.tensor(0.0, device=scales.device, dtype=scales.dtype)
-        # Print warning only once
-        if not hasattr(get_loss, '_warned_isotropic'):
-            print("[IsoGS Warning] Isotropic Gaussians detected. Flatness regularization skipped.")
-            print("[IsoGS Solution] Please set gaussian_distribution='anisotropic' in your config file, or use the forced 3D initialization.")
-            get_loss._warned_isotropic = True
-    else:
-        # Unexpected dimension
-        losses['flat'] = torch.tensor(0.0, device=scales.device, dtype=scales.dtype)
-        if not hasattr(get_loss, '_warned_unexpected_dim'):
-            print(f"[IsoGS Warning] Unexpected scales dimension: {scales.shape[1]}. Flatness regularization skipped.")
-            get_loss._warned_unexpected_dim = True
-
-    # [IsoGS] Iso-Surface Density Loss
-    if scales.shape[1] == 3:  # Only compute for anisotropic (3D) Gaussians
-        # Parameters
-        target_saturation = 1.0
-        sample_size = 4096
-        K = 16
+    # [IsoGS] Added Flatness Constraint (Optimized)
+    # Skip geometric constraints (Flat Loss and Iso Loss) during Tracking phase
+    # These losses are only needed for Mapping to optimize Gaussian shapes
+    if not tracking:
+        # Get scales from log_scales
+        scales = torch.exp(params['log_scales'])
+        # [IsoGS] Clamp scales to prevent numerical underflow
+        scales = torch.clamp(scales, min=1e-5)
         
-        # Prepare data
-        means = params['means3D']  # [N, 3]
-        opacities = torch.sigmoid(params['logit_opacities'])  # [N, 1]
+        # [IsoGS] Debug: Print scales shape (only once)
+        if not hasattr(get_loss, '_debug_printed'):
+            print(f"[IsoGS DEBUG] Scales shape: {scales.shape}, Gaussian distribution type: {'Isotropic' if scales.shape[1] == 1 else 'Anisotropic'}")
+            get_loss._debug_printed = True
         
-        # Build rotation matrices from quaternions
-        quats = F.normalize(params['unnorm_rotations'])  # [N, 4]
-        R = build_rotation(quats)  # [N, 3, 3]
-        
-        # Build scaling matrices (diagonal)
-        # scales is already [N, 3] and clamped, represents [s_x, s_y, s_z] for each Gaussian
-        # Covariance matrix: Σ = R S S^T R^T, where S = diag([s_x, s_y, s_z])
-        # Since S is diagonal: S S^T = S^2 = diag([s_x^2, s_y^2, s_z^2])
-        # Inverse: Σ^{-1} = R (S S^T)^{-1} R^T = R S^{-2} R^T
-        
-        # Compute S^{-2} = diag([1/s_x^2, 1/s_y^2, 1/s_z^2])
-        S_inv_sq = 1.0 / (scales ** 2 + 1e-8)  # [N, 3], add small epsilon for numerical stability
-        S_inv_sq_diag = torch.diag_embed(S_inv_sq)  # [N, 3, 3] - diagonal matrices
-        
-        # Compute Σ^{-1} = R S^{-2} R^T using batch matrix multiplication
-        # Step 1: R @ S^{-2}: [N, 3, 3] @ [N, 3, 3] = [N, 3, 3]
-        R_S_inv_sq = torch.bmm(R, S_inv_sq_diag)  # [N, 3, 3]
-        # Step 2: (R @ S^{-2}) @ R^T: [N, 3, 3] @ [N, 3, 3] = [N, 3, 3]
-        inverse_covariances = torch.bmm(R_S_inv_sq, R.transpose(1, 2))  # [N, 3, 3]
-        
-        # Random sampling
-        num_gaussians = means.shape[0]
-        if num_gaussians >= sample_size:
-            # Random sample indices
-            sample_indices = torch.randperm(num_gaussians, device=means.device)[:sample_size]
-            query_points = means[sample_indices]  # [sample_size, 3]
+        # Check dimensions and compute flatness loss
+        if scales.shape[1] == 3:  # Anisotropic (3D)
+            # [IsoGS] Use pure Python implementation (no torch.compile)
+            loss_flat = compute_flat_loss(scales)
+            losses['flat'] = loss_flat
+            # [IsoGS] Compute mean max scale for monitoring
+            mean_max_scale = torch.mean(torch.max(scales, dim=1).values)
+            # [IsoGS] Debug print with frequency control (every 60 calls)
+            if not hasattr(get_loss, '_debug_call_count'):
+                get_loss._debug_call_count = 0
+            get_loss._debug_call_count += 1
+            if get_loss._debug_call_count % 60 == 0:
+                print(f"[IsoGS Debug] Scales - Mean Min: {loss_flat.item():.6f} | Mean Max: {mean_max_scale.item():.6f} | Ratio: {mean_max_scale.item()/loss_flat.item():.1f}x")
+        elif scales.shape[1] == 1:  # Isotropic (1D)
+            # Skip flatness loss for isotropic Gaussians
+            losses['flat'] = torch.tensor(0.0, device=scales.device, dtype=scales.dtype)
+            # Print warning only once
+            if not hasattr(get_loss, '_warned_isotropic'):
+                print("[IsoGS Warning] Isotropic Gaussians detected. Flatness regularization skipped.")
+                print("[IsoGS Solution] Please set gaussian_distribution='anisotropic' in your config file, or use the forced 3D initialization.")
+                get_loss._warned_isotropic = True
         else:
-            # If we have fewer Gaussians than sample_size, use all
-            query_points = means  # [num_gaussians, 3]
-            sample_size = num_gaussians
-        
-        # KNN search using torch.cdist
-        try:
-            # Compute distance matrix: [sample_size, N]
-            distances = torch.cdist(query_points, means)  # [sample_size, num_gaussians]
-            # Find K nearest neighbors
-            _, neighbor_indices = torch.topk(distances, k=min(K, num_gaussians), dim=1, largest=False)  # [sample_size, K]
-        except RuntimeError as e:
-            # Fallback: if OOM, process in chunks
-            if "out of memory" in str(e):
-                print(f"[IsoGS Warning] OOM in cdist, falling back to chunked computation")
-                chunk_size = 512
-                neighbor_indices_list = []
-                for i in range(0, sample_size, chunk_size):
-                    chunk_query = query_points[i:i+chunk_size]
-                    chunk_distances = torch.cdist(chunk_query, means)
-                    _, chunk_indices = torch.topk(chunk_distances, k=min(K, num_gaussians), dim=1, largest=False)
-                    neighbor_indices_list.append(chunk_indices)
-                neighbor_indices = torch.cat(neighbor_indices_list, dim=0)
+            # Unexpected dimension
+            losses['flat'] = torch.tensor(0.0, device=scales.device, dtype=scales.dtype)
+            if not hasattr(get_loss, '_warned_unexpected_dim'):
+                print(f"[IsoGS Warning] Unexpected scales dimension: {scales.shape[1]}. Flatness regularization skipped.")
+                get_loss._warned_unexpected_dim = True
+
+        # [IsoGS] Iso-Surface Density Loss (Optimized with Stochastic Sampling)
+        if scales.shape[1] == 3:  # Only compute for anisotropic (3D) Gaussians
+            # Parameters
+            target_saturation = 1.0
+            sample_size = 8192  # [IsoGS] Increased from 4096 to 8192 for better coverage while maintaining performance
+            K = 16
+            
+            # Prepare data
+            means = params['means3D']  # [N, 3]
+            opacities = torch.sigmoid(params['logit_opacities'])  # [N, 1]
+            
+            # Build rotation matrices from quaternions
+            quats = F.normalize(params['unnorm_rotations'])  # [N, 4]
+            R = build_rotation(quats)  # [N, 3, 3]
+            
+            # Build scaling matrices (diagonal)
+            # scales is already [N, 3] and clamped, represents [s_x, s_y, s_z] for each Gaussian
+            # Covariance matrix: Σ = R S S^T R^T, where S = diag([s_x, s_y, s_z])
+            # Since S is diagonal: S S^T = S^2 = diag([s_x^2, s_y^2, s_z^2])
+            # Inverse: Σ^{-1} = R (S S^T)^{-1} R^T = R S^{-2} R^T
+            
+            # Compute S^{-2} = diag([1/s_x^2, 1/s_y^2, 1/s_z^2])
+            S_inv_sq = 1.0 / (scales ** 2 + 1e-8)  # [N, 3], add small epsilon for numerical stability
+            S_inv_sq_diag = torch.diag_embed(S_inv_sq)  # [N, 3, 3] - diagonal matrices
+            
+            # Compute Σ^{-1} = R S^{-2} R^T using batch matrix multiplication
+            # Step 1: R @ S^{-2}: [N, 3, 3] @ [N, 3, 3] = [N, 3, 3]
+            R_S_inv_sq = torch.bmm(R, S_inv_sq_diag)  # [N, 3, 3]
+            # Step 2: (R @ S^{-2}) @ R^T: [N, 3, 3] @ [N, 3, 3] = [N, 3, 3]
+            inverse_covariances = torch.bmm(R_S_inv_sq, R.transpose(1, 2))  # [N, 3, 3]
+            
+            # [IsoGS] Stochastic Sampling: Randomly sample query points each iteration
+            # This ensures coverage over multiple iterations while keeping memory usage bounded
+            num_gaussians = means.shape[0]
+            if num_gaussians >= sample_size:
+                # Random sample indices (re-sampled every iteration for better coverage)
+                sample_indices = torch.randperm(num_gaussians, device=means.device)[:sample_size]
+                query_points = means[sample_indices]  # [sample_size, 3]
             else:
-                raise
-        
-        # Collect neighbor data
-        # neighbor_indices: [sample_size, K]
-        # Expand query_points for broadcasting: [sample_size, 1, 3]
-        query_points_expanded = query_points.unsqueeze(1)  # [sample_size, 1, 3]
-        
-        # Gather neighbor means: [sample_size, K, 3]
-        neighbor_means = means[neighbor_indices]  # [sample_indices, K, 3]
-        
-        # Compute delta vectors: [sample_size, K, 3]
-        deltas = query_points_expanded - neighbor_means  # [sample_size, K, 3]
-        
-        # Gather neighbor inverse covariances: [sample_size, K, 3, 3]
-        neighbor_inv_covs = inverse_covariances[neighbor_indices]  # [sample_size, K, 3, 3]
-        
-        # Gather neighbor opacities: [sample_size, K, 1]
-        neighbor_opacities = opacities[neighbor_indices]  # [sample_size, K, 1]
-        
-        # Compute density: D = sum(α_j * exp(-0.5 * Δ^T * Σ_j^{-1} * Δ))
-        # For each query point and each neighbor:
-        #   delta: [sample_size, K, 3]
-        #   inv_cov: [sample_size, K, 3, 3]
-        #   We need: delta^T @ inv_cov @ delta for each [sample_size, K] pair
-        
-        # Reshape for batch matrix multiplication
-        deltas_reshaped = deltas.unsqueeze(-1)  # [sample_size, K, 3, 1]
-        
-        # Compute inv_cov @ delta: [sample_size, K, 3, 3] @ [sample_size, K, 3, 1] = [sample_size, K, 3, 1]
-        inv_cov_delta = torch.matmul(neighbor_inv_covs, deltas_reshaped)  # [sample_size, K, 3, 1]
-        
-        # Compute delta^T @ (inv_cov @ delta): [sample_size, K, 1, 3] @ [sample_size, K, 3, 1] = [sample_size, K, 1, 1]
-        deltas_T = deltas.unsqueeze(-2)  # [sample_size, K, 1, 3]
-        quad_form = torch.matmul(deltas_T, inv_cov_delta).squeeze(-1).squeeze(-1)  # [sample_size, K]
-        
-        # Compute exponential: exp(-0.5 * quad_form)
-        exp_term = torch.exp(-0.5 * quad_form)  # [sample_size, K]
-        
-        # Multiply by opacities and sum over neighbors
-        neighbor_opacities_squeezed = neighbor_opacities.squeeze(-1)  # [sample_size, K]
-        density_per_neighbor = neighbor_opacities_squeezed * exp_term  # [sample_size, K]
-        density_sum = density_per_neighbor.sum(dim=1)  # [sample_size]
-        
-        # Compute loss
-        density_val = density_sum  # [sample_size]
-        loss_iso = torch.mean((density_val - target_saturation) ** 2)
-        losses['iso'] = loss_iso
-        
-        # Store mean density for monitoring (as a scalar tensor, not part of loss computation)
-        losses['mean_density'] = torch.tensor(density_val.mean().item(), device=density_val.device)
+                # If we have fewer Gaussians than sample_size, use all
+                query_points = means  # [num_gaussians, 3]
+                sample_size = num_gaussians
+            
+            # [IsoGS] Use optimized function with internal batching for density computation
+            # This function handles KNN search and density calculation efficiently with chunking to avoid OOM
+            loss_iso, density_val = compute_iso_surface_loss_sampled(
+                query_points=query_points,
+                means=means,
+                inverse_covariances=inverse_covariances,
+                opacities=opacities,
+                K=K,
+                target_saturation=target_saturation,
+                chunk_size=64,  # Hard-coded internal batch size to strictly control memory usage
+            )
+            
+            losses['iso'] = loss_iso
+            
+            # Store mean density for monitoring (as a scalar tensor, not part of loss computation)
+            losses['mean_density'] = torch.tensor(density_val.mean().item(), device=density_val.device)
+        else:
+            # Skip for isotropic Gaussians
+            losses['iso'] = torch.tensor(0.0, device=scales.device, dtype=scales.dtype)
     else:
-        # Skip for isotropic Gaussians
-        losses['iso'] = torch.tensor(0.0, device=scales.device, dtype=scales.dtype)
+        # Tracking phase: skip geometric constraints to save memory and computation
+        # Only compute RGB and Depth losses for pose estimation
+        losses['flat'] = torch.tensor(0.0, device=params['log_scales'].device, dtype=params['log_scales'].dtype)
+        losses['iso'] = torch.tensor(0.0, device=params['log_scales'].device, dtype=params['log_scales'].dtype)
 
     # Visualize the Diff Images
     if tracking and visualize_tracking_loss:
@@ -504,12 +584,18 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     # [IsoGS] Ensure flatness loss weight exists with default value
     # Increased from 0.01 to 50.0 to match the scale of RGB Loss (~5e-3)
     # Current Flat Loss ~5e-5, so weight needs to be ~1000x to have comparable influence
-    if 'flat' not in loss_weights:
-        loss_weights['flat'] = 50.0
-    
-    # [IsoGS] Ensure iso-surface density loss weight exists with default value
-    if 'iso' not in loss_weights:
-        loss_weights['iso'] = 2.0
+    # Skip setting default weights for Tracking phase (geometric constraints not used)
+    if not tracking:
+        if 'flat' not in loss_weights:
+            loss_weights['flat'] = 50.0
+        
+        # [IsoGS] Ensure iso-surface density loss weight exists with default value
+        if 'iso' not in loss_weights:
+            loss_weights['iso'] = 2.0
+    else:
+        # Tracking phase: ensure flat and iso weights are 0 (losses already set to 0)
+        loss_weights['flat'] = 0.0
+        loss_weights['iso'] = 0.0
 
     # [IsoGS] Filter out monitoring metrics (like 'mean_density') from loss computation
     # Only compute weighted losses for actual loss terms
@@ -798,42 +884,78 @@ def rgbd_slam(config: dict):
     mapping_frame_time_count = 0
 
     # Load Checkpoint
+    checkpoint_time_idx = 0
     if config['load_checkpoint']:
-        checkpoint_time_idx = config['checkpoint_time_idx']
-        print(f"Loading Checkpoint for Frame {checkpoint_time_idx}")
-        ckpt_path = os.path.join(config['workdir'], config['run_name'], f"params{checkpoint_time_idx}.npz")
-        params = dict(np.load(ckpt_path, allow_pickle=True))
-        params = {k: torch.tensor(params[k]).cuda().float().requires_grad_(True) for k in params.keys()}
-        variables['max_2D_radius'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
-        variables['means2D_gradient_accum'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
-        variables['denom'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
-        variables['timestep'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
-        # Load the keyframe time idx list
-        keyframe_time_indices = np.load(os.path.join(config['workdir'], config['run_name'], f"keyframe_time_indices{checkpoint_time_idx}.npy"))
-        keyframe_time_indices = keyframe_time_indices.tolist()
-        # Update the ground truth poses list
-        for time_idx in range(checkpoint_time_idx):
-            # Load RGBD frames incrementally instead of all frames
-            color, depth, _, gt_pose = dataset[time_idx]
-            # Process poses
-            gt_w2c = torch.linalg.inv(gt_pose)
-            gt_w2c_all_frames.append(gt_w2c)
-            # Initialize Keyframe List
-            if time_idx in keyframe_time_indices:
-                # Get the estimated rotation & translation
-                curr_cam_rot = F.normalize(params['cam_unnorm_rots'][..., time_idx].detach())
-                curr_cam_tran = params['cam_trans'][..., time_idx].detach()
-                curr_w2c = torch.eye(4).cuda().float()
-                curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
-                curr_w2c[:3, 3] = curr_cam_tran
-                # Initialize Keyframe Info
-                color = color.permute(2, 0, 1) / 255
-                depth = depth.permute(2, 0, 1)
-                curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth}
-                # Add to keyframe list
-                keyframe_list.append(curr_keyframe)
-    else:
-        checkpoint_time_idx = 0
+        checkpoint_time_idx = config.get('checkpoint_time_idx', 0)
+
+        # checkpoint_time_idx < 0 表示自动从当前 run 目录中最新的 params*.npz 继续
+        if checkpoint_time_idx < 0:
+            ckpt_output_dir = os.path.join(config["workdir"], config["run_name"])
+            latest_idx = None
+            try:
+                if os.path.isdir(ckpt_output_dir):
+                    for fname in os.listdir(ckpt_output_dir):
+                        if fname.startswith("params") and fname.endswith(".npz"):
+                            num_str = fname[len("params"):-len(".npz")]
+                            if num_str.isdigit():
+                                idx = int(num_str)
+                                if (latest_idx is None) or (idx > latest_idx):
+                                    latest_idx = idx
+            except Exception as e:
+                print(f"[Checkpoint Auto-Select Warning] Failed to scan directory {ckpt_output_dir}: {e}")
+
+            if latest_idx is not None:
+                checkpoint_time_idx = latest_idx
+                print(f"[Checkpoint] Auto-selected latest checkpoint frame: {checkpoint_time_idx}")
+            else:
+                # 没有找到任何 checkpoint，直接从头开始
+                print("[Checkpoint] No existing checkpoints found, starting from frame 0.")
+                config['load_checkpoint'] = False
+                checkpoint_time_idx = 0
+
+        if config['load_checkpoint']:
+            print(f"Loading Checkpoint for Frame {checkpoint_time_idx}")
+            ckpt_path = os.path.join(config['workdir'], config['run_name'], f"params{checkpoint_time_idx}.npz")
+            params = dict(np.load(ckpt_path, allow_pickle=True))
+            params = {k: torch.tensor(params[k]).cuda().float().requires_grad_(True) for k in params.keys()}
+            variables['max_2D_radius'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
+            variables['means2D_gradient_accum'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
+            variables['denom'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
+            variables['timestep'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
+            # Load the keyframe time idx list
+            keyframe_path = os.path.join(
+                config['workdir'],
+                config['run_name'],
+                f"keyframe_time_indices{checkpoint_time_idx}.npy",
+            )
+            if os.path.exists(keyframe_path):
+                keyframe_time_indices = np.load(keyframe_path)
+                keyframe_time_indices = keyframe_time_indices.tolist()
+            else:
+                print(f"[Checkpoint Warning] Keyframe index file not found: {keyframe_path}")
+                keyframe_time_indices = []
+
+            # Update the ground truth poses list
+            for time_idx in range(checkpoint_time_idx):
+                # Load RGBD frames incrementally instead of all frames
+                color, depth, _, gt_pose = dataset[time_idx]
+                # Process poses
+                gt_w2c = torch.linalg.inv(gt_pose)
+                gt_w2c_all_frames.append(gt_w2c)
+                # Initialize Keyframe List
+                if time_idx in keyframe_time_indices:
+                    # Get the estimated rotation & translation
+                    curr_cam_rot = F.normalize(params['cam_unnorm_rots'][..., time_idx].detach())
+                    curr_cam_tran = params['cam_trans'][..., time_idx].detach()
+                    curr_w2c = torch.eye(4).cuda().float()
+                    curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
+                    curr_w2c[:3, 3] = curr_cam_tran
+                    # Initialize Keyframe Info
+                    color = color.permute(2, 0, 1) / 255
+                    depth = depth.permute(2, 0, 1)
+                    curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth}
+                    # Add to keyframe list
+                    keyframe_list.append(curr_keyframe)
     
     # Iterate over Scan
     for time_idx in tqdm(range(checkpoint_time_idx, num_frames)):
@@ -1127,8 +1249,47 @@ def rgbd_slam(config: dict):
         # Checkpoint every iteration
         if time_idx % config["checkpoint_interval"] == 0 and config['save_checkpoints']:
             ckpt_output_dir = os.path.join(config["workdir"], config["run_name"])
+            # 保存当前 checkpoint
             save_params_ckpt(params, ckpt_output_dir, time_idx)
-            np.save(os.path.join(ckpt_output_dir, f"keyframe_time_indices{time_idx}.npy"), np.array(keyframe_time_indices))
+            np.save(os.path.join(ckpt_output_dir, f"keyframe_time_indices{time_idx}.npy"),
+                    np.array(keyframe_time_indices))
+
+            # 只保留最近 N 个 checkpoint（例如最近 3 个）
+            try:
+                max_keep = 3
+                # 找到目录下所有 params*.npz
+                ckpt_files = []
+                for fname in os.listdir(ckpt_output_dir):
+                    if fname.startswith("params") and fname.endswith(".npz"):
+                        # 提取中间的数字部分：paramsXXX.npz
+                        num_str = fname[len("params"):-len(".npz")]
+                        if num_str.isdigit():
+                            ckpt_files.append((int(num_str), fname))
+
+                # 按帧号排序
+                ckpt_files.sort(key=lambda x: x[0])
+
+                # 如果多于 max_keep 个，就删掉最早的
+                if len(ckpt_files) > max_keep:
+                    num_to_delete = len(ckpt_files) - max_keep
+                    for i in range(num_to_delete):
+                        frame_idx, params_fname = ckpt_files[i]
+                        params_path = os.path.join(ckpt_output_dir, params_fname)
+                        keyframe_path = os.path.join(
+                            ckpt_output_dir, f"keyframe_time_indices{frame_idx}.npy"
+                        )
+                        try:
+                            if os.path.exists(params_path):
+                                os.remove(params_path)
+                        except OSError:
+                            pass
+                        try:
+                            if os.path.exists(keyframe_path):
+                                os.remove(keyframe_path)
+                        except OSError:
+                            pass
+            except Exception as e:
+                print(f"[Checkpoint Cleanup Warning] Failed to clean old checkpoints: {e}")
         
         # Increment WandB Time Step
         if config['use_wandb']:
