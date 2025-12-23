@@ -1,7 +1,7 @@
 # 1. 激活 conda 环境
 conda activate isogs
 # 2. 进入项目目录
-cd /home/pw_is_6/IsoGS-SLAM/SplaTAM
+cd /media/pw_is_6/Disk2/IsoGS-SLAM/SplaTAM
 # 3. 运行 SLAM（Replica 数据集）
 python scripts/splatam.py configs/replica/splatam.py
 
@@ -11,7 +11,7 @@ python scripts/splatam.py configs/replica/splatam.py
 # 1. 激活 conda 环境
 conda activate isogs
 # 2. 进入项目目录
-cd /home/pw_is_6/IsoGS-SLAM/SplaTAM
+cd /media/pw_is_6/Disk2/IsoGS-SLAM/SplaTAM
 # 3. 导出 PLY 文件
 python scripts/export_ply.py configs/replica/splatam.py
 

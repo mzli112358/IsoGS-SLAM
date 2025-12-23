@@ -5,7 +5,7 @@
 # 2) 新视角合成评估 (Novel View Synthesis Eval)
 #
 # 使用方式（推荐在已经激活 isogs 的终端里运行）：
-#   cd /home/pw_is_6/IsoGS-SLAM/SplaTAM
+#   cd /media/pw_is_6/Disk2/IsoGS-SLAM/SplaTAM
 #   bash bash_scripts/run_replica_eval_all.sh
 #
 # 如果你希望脚本自己激活 conda，请根据你本机路径修改 CONDA_BASE，再取消注释相关几行。
@@ -13,7 +13,9 @@
 # 不使用 set -e，允许单个任务失败时继续执行其他任务
 # set -e
 
-PROJECT_ROOT="/home/pw_is_6/IsoGS-SLAM/SplaTAM"
+# 自动获取项目根目录（脚本所在目录的上一级目录）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 ########################################
 # 自动激活 conda 环境
