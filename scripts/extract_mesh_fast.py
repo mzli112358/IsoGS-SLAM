@@ -61,6 +61,7 @@ def load_checkpoint(config_path, checkpoint_path=None):
     # Determine checkpoint path
     result_dir = os.path.join(config['workdir'], config['run_name'])
     
+    checkpoint_frame = None
     if checkpoint_path is None:
         # Smart checkpoint selection
         params_npz_path = os.path.join(result_dir, "params.npz")
@@ -81,6 +82,7 @@ def load_checkpoint(config_path, checkpoint_path=None):
             if checkpoint_files:
                 checkpoint_files.sort(key=lambda x: x[0], reverse=True)
                 latest_checkpoint = checkpoint_files[0]
+                checkpoint_frame = latest_checkpoint[0]
                 checkpoint_path = os.path.join(result_dir, latest_checkpoint[1])
                 print(f"✓ Auto-selected latest checkpoint: {latest_checkpoint[1]} (frame {latest_checkpoint[0]})")
                 if len(checkpoint_files) > 1:
@@ -96,12 +98,17 @@ def load_checkpoint(config_path, checkpoint_path=None):
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         print(f"✓ Using specified checkpoint: {checkpoint_path}")
+        # Try to parse frame number from filename (e.g., params800.npz)
+        basename = os.path.basename(checkpoint_path)
+        m = re.match(r'^params(\d+)\.npz$', basename)
+        if m:
+            checkpoint_frame = int(m.group(1))
     
     # Load checkpoint
     print(f"Loading checkpoint: {checkpoint_path}")
     params = dict(np.load(checkpoint_path, allow_pickle=True))
     
-    return config, params, result_dir
+    return config, params, result_dir, checkpoint_path, checkpoint_frame
 
 
 def build_inverse_covariances(params, device, min_scale_limit=0.0):
@@ -463,7 +470,7 @@ def main():
     args = parse_args()
     
     # Load checkpoint
-    config, params, result_dir = load_checkpoint(args.config, args.checkpoint)
+    config, params, result_dir, checkpoint_path, checkpoint_frame = load_checkpoint(args.config, args.checkpoint)
     
     # Set device
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -517,10 +524,18 @@ def main():
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces, vertex_normals=normals)
     
     # Save mesh
+    # 如果用户没有显式给输出文件名，则根据 checkpoint 帧号自动命名：
+    #   mesh_thickened_{frame}.ply
+    # 若无法解析出帧号，则回退到原来的 mesh_fast.ply
     if args.output is None:
-        output_path = os.path.join(result_dir, "mesh_fast.ply")
+        if checkpoint_frame is not None:
+            base_name = f"mesh_thickened_{checkpoint_frame}"
+        else:
+            base_name = "mesh_fast"
+        output_path = os.path.join(result_dir, f"{base_name}.ply")
     else:
         output_path = args.output if os.path.isabs(args.output) else os.path.join(result_dir, args.output)
+        base_name = os.path.splitext(os.path.basename(output_path))[0]
     
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
     mesh.export(output_path)
@@ -532,21 +547,53 @@ def main():
     print(f"  Faces: {len(mesh.faces):,}")
     print(f"  Bounds: {mesh.bounds}")
     print(f"  Volume: {mesh.volume:.6f}")
-
+    
     # Auto-export OBJ next to PLY (same name & directory)
     file_dir = os.path.dirname(output_path)
-    file_basename = os.path.basename(output_path)
-    base_name = os.path.splitext(file_basename)[0]
-
     if file_dir:
         obj_path = os.path.join(file_dir, f"{base_name}.obj")
+        stl_path = os.path.join(file_dir, f"{base_name}.stl")
     else:
         obj_path = f"{base_name}.obj"
+        stl_path = f"{base_name}.stl"
 
     print(f"\nExporting mesh to OBJ: {obj_path}")
     mesh.export(obj_path)
     print(f"✓ Successfully exported OBJ to: {obj_path}")
     print("  You can open it with Blender, MeshLab, CloudCompare, etc.")
+    
+    # Auto-export STL next to PLY (same name & directory)
+    print(f"\nExporting mesh to STL: {stl_path}")
+    mesh.export(stl_path)
+    print(f"✓ Successfully exported STL to: {stl_path}")
+    print("  You can open it with Blender, MeshLab, CloudCompare, etc.")
+
+    # Also export a TXT log with the same命名规范，记录本次导出关键信息和调用命令
+    if file_dir:
+        txt_path = os.path.join(file_dir, f"{base_name}.txt")
+    else:
+        txt_path = f"{base_name}.txt"
+
+    try:
+        with open(txt_path, "w", encoding="utf-8") as f:
+            # 还原命令行（近似）：在前面加上 python 方便复制
+            cmd_str = "python " + " ".join(sys.argv)
+            f.write(f"{cmd_str}\n\n")
+            f.write(f"Checkpoint: {checkpoint_path}\n")
+            if checkpoint_frame is not None:
+                f.write(f"Checkpoint frame: {checkpoint_frame}\n")
+            f.write(f"Voxel size: {args.voxel_size}\n")
+            f.write(f"Iso level: {args.iso_level}\n")
+            f.write(f"Block size: {args.block_size}\n")
+            f.write(f"No cleaning: {args.no_cleaning}\n")
+            f.write(f"Output PLY: {output_path}\n")
+            f.write(f"Output OBJ: {obj_path}\n")
+            f.write(f"Output STL: {stl_path}\n")
+            f.write(f"Vertices: {len(mesh.vertices)}\n")
+            f.write(f"Faces: {len(mesh.faces)}\n")
+        print(f"✓ Exported log TXT to: {txt_path}")
+    except Exception as e:
+        print(f"[Warning] Failed to write TXT log file: {e}")
 
     # Optionally open interactive 3D viewer
     if args.no_show:

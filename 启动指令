@@ -1,47 +1,37 @@
 # 1. 激活 conda 环境
 conda activate isogs
-
 # 2. 进入项目目录
 cd /home/pw_is_6/IsoGS-SLAM/SplaTAM
-
 # 3. 运行 SLAM（Replica 数据集）
 python scripts/splatam.py configs/replica/splatam.py
 
 
+
+
 # 1. 激活 conda 环境
 conda activate isogs
-
 # 2. 进入项目目录
 cd /home/pw_is_6/IsoGS-SLAM/SplaTAM
-
 # 3. 导出 PLY 文件
 python scripts/export_ply.py configs/replica/splatam.py
 
 
 
-python scripts/extract_mesh_fast.py configs/replica/splatam.py \
-  --checkpoint /home/pw_is_6/IsoGS-SLAM/SplaTAM/experiments/Replica/splatam_output/room0_0/params.npz \
-  --iso-level 0.8 \
-  --output mesh_room0_0_tmp_iso0.8_full.ply \
-  --no-cleaning \
-  --no-show
+
   
-  
-  # 不需要太细的体素，靠“增厚”来补洞
+# 不需要太细的体素，靠“增厚”来补洞
 # 使用 0.01 的精度，iso-level 可以稍微回调一些
 python scripts/extract_mesh_fast.py configs/replica/splatam.py \
     --voxel-size 0.01 \
     --iso-level 0.3 \
-    --no-cleaning \
+    --no-cleaning
+    
+    
+    
+     \
     --output mesh_thickened_1350.ply
 
 
 
-conda activate isogs
-cd /home/pw_is_6/IsoGS-SLAM/SplaTAM
-python viz_scripts/final_recon.py experiments/Replica/room1_0/params850.npz
-
-
-conda activate isogs
-cd /home/pw_is_6/IsoGS-SLAM/SplaTAM
-python viz_scripts/online_recon.py experiments/Replica/room1_0/params850.npz
+bash bash_scripts/run_replica_mesh_eval_all.sh
+bash bash_scripts/run_replica_mesh_eval_all.sh --render-views --render-every=10

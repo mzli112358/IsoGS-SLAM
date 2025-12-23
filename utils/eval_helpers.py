@@ -1,5 +1,6 @@
 import cv2
 import os
+import json
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -640,6 +641,37 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
     np.savetxt(os.path.join(eval_dir, "l1.txt"), l1_list)
     np.savetxt(os.path.join(eval_dir, "ssim.txt"), ssim_list)
     np.savetxt(os.path.join(eval_dir, "lpips.txt"), lpips_list)
+
+    # Save final summary metrics to text file and JSON
+    summary_dict = {
+        "Final Average ATE RMSE (cm)": float(ate_rmse * 100),
+        "Average PSNR": float(avg_psnr),
+        "Average Depth RMSE (cm)": float(avg_rmse * 100),
+        "Average Depth L1 (cm)": float(avg_l1 * 100),
+        "Average MS-SSIM": float(avg_ssim),
+        "Average LPIPS": float(avg_lpips),
+    }
+    
+    # Save as human-readable text file
+    summary_txt_path = os.path.join(eval_dir, "eval_summary.txt")
+    with open(summary_txt_path, "w", encoding="utf-8") as f:
+        f.write("=" * 60 + "\n")
+        f.write("Final Evaluation Metrics Summary\n")
+        f.write("=" * 60 + "\n\n")
+        f.write(f"Final Average ATE RMSE: {ate_rmse*100:.2f} cm\n")
+        f.write(f"Average PSNR: {avg_psnr:.2f}\n")
+        f.write(f"Average Depth RMSE: {avg_rmse*100:.2f} cm\n")
+        f.write(f"Average Depth L1: {avg_l1*100:.2f} cm\n")
+        f.write(f"Average MS-SSIM: {avg_ssim:.3f}\n")
+        f.write(f"Average LPIPS: {avg_lpips:.3f}\n")
+        f.write("\n" + "=" * 60 + "\n")
+    print(f"\nEvaluation summary saved to: {summary_txt_path}")
+    
+    # Save as JSON for programmatic access
+    summary_json_path = os.path.join(eval_dir, "eval_summary.json")
+    with open(summary_json_path, "w", encoding="utf-8") as f:
+        json.dump(summary_dict, f, indent=2)
+    print(f"Evaluation summary (JSON) saved to: {summary_json_path}")
 
     # Plot PSNR & L1 as line plots
     fig, axs = plt.subplots(1, 2, figsize=(12, 4))

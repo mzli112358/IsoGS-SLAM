@@ -1,8 +1,10 @@
 import argparse
+import json
 import os
 import shutil
 import sys
 import time
+import csv
 from importlib.machinery import SourceFileLoader
 
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -36,7 +38,9 @@ from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, dens
 
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 
-# [IsoGS] Core computation functions for geometric constraints (extracted for optimization)
+
+# [IsoGS] -------------------------------------------
+# Core computation functions for geometric constraints (extracted for optimization)
 def compute_flat_loss(scales):
     """
     Compute flatness loss from Gaussian scales.
@@ -52,6 +56,109 @@ def compute_flat_loss(scales):
     return loss_flat
 
 
+# [IsoGS] -------------------------------------------
+# CSV 日志相关的辅助函数，用于记录每帧 Tracking / Mapping 指标，支持断点续跑时覆盖后续帧
+def _init_metrics_csv(output_dir, checkpoint_time_idx):
+    """
+    初始化（或截断）指标 CSV 文件。
+    
+    规则：
+    - 文件名固定为 metrics_log.csv，位于当前 run 目录下；
+    - 如果不存在则创建并写入表头；
+    - 如果已存在且 checkpoint_time_idx > 0，则只保留 frame < checkpoint_time_idx 的行，
+      这样从 checkpoint 继续运行时，会覆盖 checkpoint 之后的帧的记录。
+    """
+    csv_path = os.path.join(output_dir, "metrics_log.csv")
+    fieldnames = [
+        "frame",          # 当前全局帧号 time_idx
+        "stage",          # 'tracking' 或 'mapping'
+        "step",           # 对应的迭代 step（与终端打印中的 Step 一致）
+        "loss",
+        "image_loss",
+        "depth_loss",
+        "flat_loss",
+        "iso_loss",
+        "mean_density",
+    ]
+
+    # 如果文件不存在，直接创建空表头
+    if not os.path.exists(csv_path):
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+        return csv_path, fieldnames
+
+    # 文件存在的情况：根据 checkpoint_time_idx 截断
+    keep_rows = []
+    try:
+        with open(csv_path, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    frame_val = int(row.get("frame", -1))
+                except ValueError:
+                    # 非法行直接丢弃
+                    continue
+                # 只保留 checkpoint 之前的帧，后面的会被本次运行覆盖
+                if checkpoint_time_idx is not None and frame_val >= 0 and frame_val < checkpoint_time_idx:
+                    keep_rows.append(row)
+    except Exception:
+        # 读失败时，直接重新创建文件，避免中断主流程
+        keep_rows = []
+
+    # 重写文件：写入表头 + 保留的旧记录
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        if keep_rows:
+            writer.writerows(keep_rows)
+
+    return csv_path, fieldnames
+
+
+def _append_metrics_row(csv_path, fieldnames, frame_idx, stage, step_idx, losses):
+    """
+    追加一行指标到 CSV：
+    - frame_idx: 当前全局帧编号（time_idx）
+    - stage: 'tracking' 或 'mapping'
+    - step_idx: 与终端中 [Tracking]/[Mapping] Step 对应的迭代编号
+    - losses: get_loss / report_loss 中的 losses 字典
+    """
+    if csv_path is None:
+        return
+
+    def _to_float(val, default=0.0):
+        try:
+            if val is None:
+                return default
+            # 兼容 torch.Tensor
+            if hasattr(val, "item"):
+                return float(val.item())
+            return float(val)
+        except Exception:
+            return default
+
+    row = {
+        "frame": int(frame_idx),
+        "stage": str(stage),
+        "step": int(step_idx),
+        "loss": _to_float(losses.get("loss")),
+        "image_loss": _to_float(losses.get("im")),
+        "depth_loss": _to_float(losses.get("depth")),
+        "flat_loss": _to_float(losses.get("flat")),
+        "iso_loss": _to_float(losses.get("iso")),
+        "mean_density": _to_float(losses.get("mean_density"), default=0.0),
+    }
+
+    try:
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writerow(row)
+    except Exception:
+        # 日志失败不应影响主流程，静默忽略
+        pass
+
+
 def compute_iso_surface_loss_sampled(
     query_points,  # [sample_size, 3]
     means,  # [N, 3]
@@ -59,7 +166,7 @@ def compute_iso_surface_loss_sampled(
     opacities,  # [N, 1]
     K,  # int
     target_saturation,  # float
-    chunk_size=64,  # int: internal batch size to avoid OOM
+    chunk_size=128,  # int: internal batch size to avoid OOM
 ):
     """
     Compute iso-surface density loss using sampled query points with internal batching.
@@ -346,6 +453,44 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio,
         return params, variables, intrinsics, w2c, cam
 
 
+def add_camera_params_to_checkpoint(params, variables, intrinsics, first_frame_w2c, 
+                                    dataset_config, gt_w2c_all_frames, keyframe_time_indices):
+    """
+    为检查点添加相机参数，使其可以用于可视化。
+    
+    Args:
+        params: 高斯参数字典
+        variables: 包含 timestep 等变量
+        intrinsics: 相机内参
+        first_frame_w2c: 第一帧的相机位姿
+        dataset_config: 数据集配置，包含 org_width 和 org_height
+        gt_w2c_all_frames: 所有帧的GT相机位姿（到当前帧为止）
+        keyframe_time_indices: 关键帧索引列表
+    
+    Returns:
+        添加了相机参数的 params 字典
+    """
+    # 创建副本以避免修改原始字典
+    params_with_camera = params.copy()
+    
+    # 添加相机参数
+    params_with_camera['timestep'] = variables['timestep']
+    params_with_camera['intrinsics'] = intrinsics.detach().cpu().numpy()
+    params_with_camera['w2c'] = first_frame_w2c.detach().cpu().numpy()
+    params_with_camera['org_width'] = dataset_config["desired_image_width"]
+    params_with_camera['org_height'] = dataset_config["desired_image_height"]
+    
+    # 保存到当前帧为止的所有GT位姿
+    params_with_camera['gt_w2c_all_frames'] = []
+    for gt_w2c_tensor in gt_w2c_all_frames:
+        params_with_camera['gt_w2c_all_frames'].append(gt_w2c_tensor.detach().cpu().numpy())
+    params_with_camera['gt_w2c_all_frames'] = np.stack(params_with_camera['gt_w2c_all_frames'], axis=0)
+    
+    params_with_camera['keyframe_time_indices'] = np.array(keyframe_time_indices)
+    
+    return params_with_camera
+
+
 def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_for_loss,
              sil_thres, use_l1, ignore_outlier_depth_loss, tracking=False, 
              mapping=False, do_ba=False, plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None):
@@ -518,7 +663,7 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
                 opacities=opacities,
                 K=K,
                 target_saturation=target_saturation,
-                chunk_size=64,  # Hard-coded internal batch size to strictly control memory usage
+                chunk_size=128,  # Hard-coded internal batch size to strictly control memory usage
             )
             
             losses['iso'] = loss_iso
@@ -744,6 +889,9 @@ def rgbd_slam(config: dict):
     output_dir = os.path.join(config["workdir"], config["run_name"])
     eval_dir = os.path.join(output_dir, "eval")
     os.makedirs(eval_dir, exist_ok=True)
+    # [IsoGS] 初始化指标 CSV 日志路径（具体截断逻辑在确定 checkpoint_time_idx 后再执行）
+    metrics_csv_path = None
+    metrics_fieldnames = None
     
     # Init WandB
     if config['use_wandb']:
@@ -815,6 +963,9 @@ def rgbd_slam(config: dict):
     num_frames = dataset_config["num_frames"]
     if num_frames == -1:
         num_frames = len(dataset)
+
+    # [IsoGS] 可选的结束帧（由命令行 --end-at 传入，挂在 config['end_at'] 上）
+    end_at = config.get("end_at", None)
 
     # Init seperate dataloader for densification if required
     if seperate_densification_res:
@@ -917,11 +1068,73 @@ def rgbd_slam(config: dict):
             print(f"Loading Checkpoint for Frame {checkpoint_time_idx}")
             ckpt_path = os.path.join(config['workdir'], config['run_name'], f"params{checkpoint_time_idx}.npz")
             params = dict(np.load(ckpt_path, allow_pickle=True))
+            
+            # 如果检查点中有 timestep，先保存到 variables，然后从 params 中移除
+            # timestep 是标量值，不是需要优化的参数
+            if 'timestep' in params:
+                variables['timestep'] = torch.tensor(params['timestep']).cuda().float()
+                params.pop('timestep')
+            
+            # 移除其他相机参数，这些不应该被优化器处理
+            # 这些参数在保存检查点时被添加，但加载后需要移除
+            camera_params_to_remove = ['intrinsics', 'w2c', 'org_width', 'org_height', 
+                                      'gt_w2c_all_frames', 'keyframe_time_indices']
+            for k in camera_params_to_remove:
+                if k in params:
+                    params.pop(k)
+            
+            # 转换为 torch tensor 并设置 requires_grad
             params = {k: torch.tensor(params[k]).cuda().float().requires_grad_(True) for k in params.keys()}
-            variables['max_2D_radius'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
-            variables['means2D_gradient_accum'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
-            variables['denom'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
-            variables['timestep'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
+            
+            # 获取当前高斯点的数量
+            current_num_gaussians = params['means3D'].shape[0]
+            
+            # 初始化 variables
+            variables['max_2D_radius'] = torch.zeros(current_num_gaussians).cuda().float()
+            variables['means2D_gradient_accum'] = torch.zeros(current_num_gaussians).cuda().float()
+            variables['denom'] = torch.zeros(current_num_gaussians).cuda().float()
+            
+            # 处理 timestep：确保它的形状与当前高斯点数量匹配
+            # timestep 记录每个高斯点是在哪一帧创建的，必须与高斯点数量一一对应
+            if 'timestep' in variables:
+                # 如果从检查点加载了 timestep，检查形状是否匹配
+                if variables['timestep'].shape[0] != current_num_gaussians:
+                    old_size = variables['timestep'].shape[0]
+                    # 形状不匹配：这不应该发生，因为检查点保存时应该包含所有高斯点
+                    # 可能的原因：
+                    # 1. 检查点文件损坏/不完整
+                    # 2. 检查点保存后，在保存和加载之间添加了新点（不应该发生）
+                    # 3. 检查点保存逻辑有问题
+                    print(f"[Warning] timestep size mismatch detected!")
+                    print(f"  Checkpoint timestep size: {old_size}")
+                    print(f"  Current params size: {current_num_gaussians}")
+                    print(f"  Checkpoint frame: {checkpoint_time_idx}")
+                    
+                    if old_size < current_num_gaussians:
+                        # 检查点中的 timestep 小于当前高斯点数量
+                        # 最安全的做法：重新初始化所有 timestep，使用检查点帧号作为默认值
+                        # 这样虽然丢失了原始时间步信息，但至少保证了一致性
+                        # 新添加的点会通过 add_new_gaussians 获得正确的时间步
+                        print(f"[Warning] Reinitializing timestep to match current size")
+                        print(f"[Warning] All points will be marked as created at frame {checkpoint_time_idx}")
+                        print(f"[Warning] New points added later will get correct timestep via add_new_gaussians")
+                        variables['timestep'] = torch.full(
+                            (current_num_gaussians,), 
+                            float(checkpoint_time_idx), 
+                            device="cuda"
+                        ).float()
+                    else:
+                        # 如果旧的大小更大（不应该发生），截断它
+                        print(f"[Warning] Truncating timestep from {old_size} to {current_num_gaussians}")
+                        variables['timestep'] = variables['timestep'][:current_num_gaussians]
+            else:
+                # 如果没有从检查点加载 timestep，初始化为检查点帧号
+                # 这样所有点都被标记为在检查点帧创建
+                variables['timestep'] = torch.full(
+                    (current_num_gaussians,), 
+                    float(checkpoint_time_idx), 
+                    device="cuda"
+                ).float()
             # Load the keyframe time idx list
             keyframe_path = os.path.join(
                 config['workdir'],
@@ -956,9 +1169,35 @@ def rgbd_slam(config: dict):
                     curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth}
                     # Add to keyframe list
                     keyframe_list.append(curr_keyframe)
-    
+
+    # [IsoGS] 在确定最终的 checkpoint_time_idx 之后，初始化/截断指标 CSV
+    metrics_csv_path, metrics_fieldnames = _init_metrics_csv(output_dir, checkpoint_time_idx)
+
+    # [IsoGS] 计算这次运行的实际结束帧（end_frame），并处理 “已跑完” 的情况
+    end_frame = num_frames - 1  # 默认最后一帧索引（0-based）
+    if end_at is not None:
+        # end_at 是帧号（0-based 或 1-based）的终止上限：在 case2 中你已经允许“对齐到最近的 checkpoint”
+        # 这里只做简单裁剪，实际保存仍由 checkpoint_interval 控制
+        if end_at < checkpoint_time_idx:
+            # Case4: 用户要求的 end_at 小于已经存在的 checkpoint 帧
+            print(f"[End-At] You have already finished at frame {checkpoint_time_idx}. Requested end_at={end_at}. Nothing to do.")
+            return
+        # 将 end_frame 裁剪到 [checkpoint_time_idx, num_frames-1] 区间内
+        end_frame = min(int(end_at), num_frames - 1)
+
+    if checkpoint_time_idx >= num_frames:
+        # 数据本身已经全跑完
+        print(f"[End-At] Dataset already fully processed. checkpoint_time_idx={checkpoint_time_idx}, num_frames={num_frames}")
+        return
+
+    if end_frame <= checkpoint_time_idx:
+        print(f"[End-At] Nothing to do. checkpoint_time_idx={checkpoint_time_idx}, end_frame={end_frame}")
+        return
+
+    print(f"[End-At] Will process frames from {checkpoint_time_idx} to {end_frame} (inclusive).")
+
     # Iterate over Scan
-    for time_idx in tqdm(range(checkpoint_time_idx, num_frames)):
+    for time_idx in tqdm(range(checkpoint_time_idx, end_frame + 1)):
         # Load RGBD frames incrementally instead of all frames
         color, depth, _, gt_pose = dataset[time_idx]
         # Process poses
@@ -1008,14 +1247,36 @@ def rgbd_slam(config: dict):
             while True:
                 iter_start_time = time.time()
                 # Loss for current frame
-                loss, variables, losses = get_loss(params, tracking_curr_data, variables, iter_time_idx, config['tracking']['loss_weights'],
-                                                   config['tracking']['use_sil_for_loss'], config['tracking']['sil_thres'],
-                                                   config['tracking']['use_l1'], config['tracking']['ignore_outlier_depth_loss'], tracking=True, 
-                                                   plot_dir=eval_dir, visualize_tracking_loss=config['tracking']['visualize_tracking_loss'],
-                                                   tracking_iteration=iter)
+                loss, variables, losses = get_loss(
+                    params,
+                    tracking_curr_data,
+                    variables,
+                    iter_time_idx,
+                    config['tracking']['loss_weights'],
+                    config['tracking']['use_sil_for_loss'],
+                    config['tracking']['sil_thres'],
+                    config['tracking']['use_l1'],
+                    config['tracking']['ignore_outlier_depth_loss'],
+                    tracking=True,
+                    plot_dir=eval_dir,
+                    visualize_tracking_loss=config['tracking']['visualize_tracking_loss'],
+                    tracking_iteration=iter,
+                )
                 if config['use_wandb']:
                     # Report Loss
                     wandb_tracking_step = report_loss(losses, wandb_run, wandb_tracking_step, tracking=True)
+                else:
+                    # 即便不使用 wandb，也通过 report_loss 打印并驱动 CSV 记录
+                    wandb_tracking_step = report_loss(losses, None, wandb_tracking_step, tracking=True)
+                # [IsoGS] 记录 Tracking 指标到 CSV（frame = 当前 time_idx）
+                _append_metrics_row(
+                    metrics_csv_path,
+                    metrics_fieldnames,
+                    frame_idx=time_idx,
+                    stage="tracking",
+                    step_idx=max(wandb_tracking_step - 1, 0),
+                    losses=losses,
+                )
                 # Backprop
                 loss.backward()
                 # Optimizer Update
@@ -1088,7 +1349,12 @@ def rgbd_slam(config: dict):
                 progress_bar.close()
             except:
                 ckpt_output_dir = os.path.join(config["workdir"], config["run_name"])
-                save_params_ckpt(params, ckpt_output_dir, time_idx)
+                # 添加相机参数以便检查点可以用于可视化
+                params_with_camera = add_camera_params_to_checkpoint(
+                    params, variables, intrinsics, first_frame_w2c, 
+                    dataset_config, gt_w2c_all_frames, keyframe_time_indices
+                )
+                save_params_ckpt(params_with_camera, ckpt_output_dir, time_idx)
                 print('Failed to evaluate trajectory.')
 
         # Densification & KeyFrame-based Mapping
@@ -1162,9 +1428,18 @@ def rgbd_slam(config: dict):
                 iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx, 
                              'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c}
                 # Loss for current frame
-                loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
-                                                config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
-                                                config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'], mapping=True)
+                loss, variables, losses = get_loss(
+                    params,
+                    iter_data,
+                    variables,
+                    iter_time_idx,
+                    config['mapping']['loss_weights'],
+                    config['mapping']['use_sil_for_loss'],
+                    config['mapping']['sil_thres'],
+                    config['mapping']['use_l1'],
+                    config['mapping']['ignore_outlier_depth_loss'],
+                    mapping=True,
+                )
                 # [IsoGS] Report loss regardless of wandb status
                 if config['use_wandb']:
                     # Report Loss
@@ -1172,6 +1447,15 @@ def rgbd_slam(config: dict):
                 else:
                     # Call report_loss with None wandb_run to enable terminal printing
                     wandb_mapping_step = report_loss(losses, None, wandb_mapping_step, mapping=True)
+                # [IsoGS] 记录 Mapping 指标到 CSV（frame = 当前 time_idx）
+                _append_metrics_row(
+                    metrics_csv_path,
+                    metrics_fieldnames,
+                    frame_idx=time_idx,
+                    stage="mapping",
+                    step_idx=max(wandb_mapping_step - 1, 0),
+                    losses=losses,
+                )
                 # Backprop
                 loss.backward()
                 with torch.no_grad():
@@ -1227,7 +1511,12 @@ def rgbd_slam(config: dict):
                     progress_bar.close()
                 except:
                     ckpt_output_dir = os.path.join(config["workdir"], config["run_name"])
-                    save_params_ckpt(params, ckpt_output_dir, time_idx)
+                    # 添加相机参数以便检查点可以用于可视化
+                    params_with_camera = add_camera_params_to_checkpoint(
+                        params, variables, intrinsics, first_frame_w2c, 
+                        dataset_config, gt_w2c_all_frames, keyframe_time_indices
+                    )
+                    save_params_ckpt(params_with_camera, ckpt_output_dir, time_idx)
                     print('Failed to evaluate trajectory.')
         
         # Add frame to keyframe list
@@ -1249,8 +1538,13 @@ def rgbd_slam(config: dict):
         # Checkpoint every iteration
         if time_idx % config["checkpoint_interval"] == 0 and config['save_checkpoints']:
             ckpt_output_dir = os.path.join(config["workdir"], config["run_name"])
+            # 添加相机参数以便检查点可以用于可视化
+            params_with_camera = add_camera_params_to_checkpoint(
+                params, variables, intrinsics, first_frame_w2c, 
+                dataset_config, gt_w2c_all_frames, keyframe_time_indices
+            )
             # 保存当前 checkpoint
-            save_params_ckpt(params, ckpt_output_dir, time_idx)
+            save_params_ckpt(params_with_camera, ckpt_output_dir, time_idx)
             np.save(os.path.join(ckpt_output_dir, f"keyframe_time_indices{time_idx}.npy"),
                     np.array(keyframe_time_indices))
 
@@ -1312,6 +1606,58 @@ def rgbd_slam(config: dict):
     print(f"Average Tracking/Frame Time: {tracking_frame_time_avg} s")
     print(f"Average Mapping/Iteration Time: {mapping_iter_time_avg*1000} ms")
     print(f"Average Mapping/Frame Time: {mapping_frame_time_avg} s")
+
+    # [End-At] 打印本次运行实际停在的帧号（Case3）
+    # 注意：循环最后一次的 time_idx 就是最终帧
+    final_frame = min(end_frame, num_frames - 1)
+    print(f"[End-At] Finished at frame {final_frame}.")
+    
+    # 计算最后一个已保存的检查点帧号
+    # 评估应该只评估到最后一个已保存的检查点，而不是 final_frame
+    # 因为 final_frame 之后的数据可能还没有保存到检查点中
+    checkpoint_interval = config.get("checkpoint_interval", 100)
+    last_saved_checkpoint = (final_frame // checkpoint_interval) * checkpoint_interval
+    
+    # 如果 final_frame 正好是检查点，那么最后一个检查点就是 final_frame
+    # 否则，最后一个检查点是小于 final_frame 的最大检查点
+    if final_frame % checkpoint_interval == 0:
+        last_saved_checkpoint = final_frame
+    else:
+        # 最后一个检查点是小于 final_frame 的最大检查点
+        last_saved_checkpoint = (final_frame // checkpoint_interval) * checkpoint_interval
+    
+    # 计算实际评估的帧数（last_saved_checkpoint 是 0-based 索引，所以需要 +1）
+    eval_num_frames = last_saved_checkpoint + 1
+    print(f"[Eval] Last saved checkpoint: {last_saved_checkpoint}, will evaluate frames 0 to {last_saved_checkpoint} (total: {eval_num_frames} frames)")
+    
+    # Save runtime statistics to file
+    runtime_stats_dict = {
+        "Average Tracking/Iteration Time (ms)": float(tracking_iter_time_avg * 1000),
+        "Average Tracking/Frame Time (s)": float(tracking_frame_time_avg),
+        "Average Mapping/Iteration Time (ms)": float(mapping_iter_time_avg * 1000),
+        "Average Mapping/Frame Time (s)": float(mapping_frame_time_avg),
+        "Final Frame": int(final_frame),
+    }
+    
+    # Save as human-readable text file
+    runtime_stats_txt_path = os.path.join(output_dir, "runtime_stats.txt")
+    with open(runtime_stats_txt_path, "w", encoding="utf-8") as f:
+        f.write("=" * 60 + "\n")
+        f.write("Runtime Statistics Summary\n")
+        f.write("=" * 60 + "\n\n")
+        f.write(f"Average Tracking/Iteration Time: {tracking_iter_time_avg*1000:.2f} ms\n")
+        f.write(f"Average Tracking/Frame Time: {tracking_frame_time_avg:.4f} s\n")
+        f.write(f"Average Mapping/Iteration Time: {mapping_iter_time_avg*1000:.2f} ms\n")
+        f.write(f"Average Mapping/Frame Time: {mapping_frame_time_avg:.4f} s\n")
+        f.write(f"Final Frame: {final_frame}\n")
+        f.write("\n" + "=" * 60 + "\n")
+    print(f"\nRuntime statistics saved to: {runtime_stats_txt_path}")
+    
+    # Save as JSON for programmatic access
+    runtime_stats_json_path = os.path.join(output_dir, "runtime_stats.json")
+    with open(runtime_stats_json_path, "w", encoding="utf-8") as f:
+        json.dump(runtime_stats_dict, f, indent=2)
+    print(f"Runtime statistics (JSON) saved to: {runtime_stats_json_path}")
     if config['use_wandb']:
         wandb_run.log({"Final Stats/Average Tracking Iteration Time (ms)": tracking_iter_time_avg*1000,
                        "Final Stats/Average Tracking Frame Time (s)": tracking_frame_time_avg,
@@ -1320,31 +1666,35 @@ def rgbd_slam(config: dict):
                        "Final Stats/step": 1})
     
     # Evaluate Final Parameters
+    # 使用最后一个已保存的检查点帧数进行评估，而不是 final_frame
+    # 因为 final_frame 之后的数据可能还没有保存到检查点中
+    print(f"Evaluating {eval_num_frames} frames (from 0 to {last_saved_checkpoint})...")
     with torch.no_grad():
         if config['use_wandb']:
-            eval(dataset, params, num_frames, eval_dir, sil_thres=config['mapping']['sil_thres'],
+            eval(dataset, params, eval_num_frames, eval_dir, sil_thres=config['mapping']['sil_thres'],
                  wandb_run=wandb_run, wandb_save_qual=config['wandb']['eval_save_qual'],
                  mapping_iters=config['mapping']['num_iters'], add_new_gaussians=config['mapping']['add_new_gaussians'],
                  eval_every=config['eval_every'])
         else:
-            eval(dataset, params, num_frames, eval_dir, sil_thres=config['mapping']['sil_thres'],
+            eval(dataset, params, eval_num_frames, eval_dir, sil_thres=config['mapping']['sil_thres'],
                  mapping_iters=config['mapping']['num_iters'], add_new_gaussians=config['mapping']['add_new_gaussians'],
                  eval_every=config['eval_every'])
 
-    # Add Camera Parameters to Save them
-    params['timestep'] = variables['timestep']
-    params['intrinsics'] = intrinsics.detach().cpu().numpy()
-    params['w2c'] = first_frame_w2c.detach().cpu().numpy()
-    params['org_width'] = dataset_config["desired_image_width"]
-    params['org_height'] = dataset_config["desired_image_height"]
-    params['gt_w2c_all_frames'] = []
-    for gt_w2c_tensor in gt_w2c_all_frames:
-        params['gt_w2c_all_frames'].append(gt_w2c_tensor.detach().cpu().numpy())
-    params['gt_w2c_all_frames'] = np.stack(params['gt_w2c_all_frames'], axis=0)
-    params['keyframe_time_indices'] = np.array(keyframe_time_indices)
-    
-    # Save Parameters
-    save_params(params, output_dir)
+    # 如果最后一帧不是检查点，保存最终检查点
+    # 这样就不需要单独的 params.npz 了，所有脚本都会自动使用最新的检查点
+    checkpoint_interval = config.get("checkpoint_interval", 100)
+    if config['save_checkpoints'] and final_frame % checkpoint_interval != 0:
+        ckpt_output_dir = os.path.join(config["workdir"], config["run_name"])
+        # 添加相机参数以便检查点可以用于可视化
+        params_with_camera = add_camera_params_to_checkpoint(
+            params, variables, intrinsics, first_frame_w2c, 
+            dataset_config, gt_w2c_all_frames, keyframe_time_indices
+        )
+        # 保存最终检查点
+        save_params_ckpt(params_with_camera, ckpt_output_dir, final_frame)
+        np.save(os.path.join(ckpt_output_dir, f"keyframe_time_indices{final_frame}.npy"),
+                np.array(keyframe_time_indices))
+        print(f"Saved final checkpoint: params{final_frame}.npz")
 
     # Close WandB Run
     if config['use_wandb']:
@@ -1354,6 +1704,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument("experiment", type=str, help="Path to experiment file")
+    # [End-At] 可选结束帧参数：python scripts/splatam.py configs/replica/splatam.py --end-at 800
+    parser.add_argument(
+        "--end-at",
+        type=int,
+        default=None,
+        help="Stop SLAM after reaching this frame index (inclusive). "
+             "If smaller than existing checkpoint frame, nothing will be done.",
+    )
 
     args = parser.parse_args()
 
@@ -1364,6 +1722,11 @@ if __name__ == "__main__":
     # Set Experiment Seed
     seed_everything(seed=experiment.config['seed'])
     
+    # 把 end-at 挂到 config 上，供 rgbd_slam 使用
+    if args.end_at is not None:
+        experiment.config["end_at"] = args.end_at
+        print(f"[End-At] Requested end_at={args.end_at}")
+
     # Create Results Directory and Copy Config
     results_dir = os.path.join(
         experiment.config["workdir"], experiment.config["run_name"]

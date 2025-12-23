@@ -3,11 +3,26 @@ from os.path import join as p_join
 
 scenes = ["room0", "room1", "room2",
           "office0", "office1", "office2",
-          "office_", "office4"]
+          "office3", "office4"]
 
 primary_device="cuda:0"
 seed = 0
-scene_name = scenes[2]
+
+# 通过环境变量 SPLATAM_SCENE_INDEX 控制场景索引（0-7），默认仍为 0
+_scene_idx_env = os.environ.get("SPLATAM_SCENE_INDEX", None)
+if _scene_idx_env is not None:
+    try:
+        _idx = int(_scene_idx_env)
+        if 0 <= _idx < len(scenes):
+            scene_name = scenes[_idx]
+        else:
+            print(f"[Scene Config] Invalid SPLATAM_SCENE_INDEX={_scene_idx_env}, fall back to scenes[0]")
+            scene_name = scenes[0]
+    except ValueError:
+        print(f"[Scene Config] Failed to parse SPLATAM_SCENE_INDEX={_scene_idx_env}, fall back to scenes[0]")
+        scene_name = scenes[0]
+else:
+    scene_name = scenes[0]
 
 map_every = 5
 keyframe_every = 5
