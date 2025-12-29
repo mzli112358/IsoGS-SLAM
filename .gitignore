@@ -172,7 +172,8 @@ cython_debug/
 整合代码文件.py
 整合代码文件.txt
 diff-gaussian-rasterization-w-depth.git/
-diff-gaussian-rasterization-w-depth/third_party/
+diff-gaussian-rasterization-w-depth/
+.vscode/
 
 # Large data files
 *.ply
