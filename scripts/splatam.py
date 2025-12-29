@@ -493,7 +493,7 @@ def add_camera_params_to_checkpoint(params, variables, intrinsics, first_frame_w
 
 def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_for_loss,
              sil_thres, use_l1, ignore_outlier_depth_loss, tracking=False, 
-             mapping=False, do_ba=False, plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None):
+             mapping=False, do_ba=False, plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None, mapping_iteration=None):
     # Initialize Loss Dictionary
     losses = {}
 
@@ -613,63 +613,72 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
 
         # [IsoGS] Iso-Surface Density Loss (Optimized with Stochastic Sampling)
         if scales.shape[1] == 3:  # Only compute for anisotropic (3D) Gaussians
-            # Parameters
-            target_saturation = 1.0
-            sample_size = 8192  # [IsoGS] Increased from 4096 to 8192 for better coverage while maintaining performance
-            K = 16
+            # [IsoGS] Performance optimization: Only compute Iso Loss every 5 iterations to reduce computation
+            # This significantly speeds up mapping while maintaining regularization effectiveness
+            should_compute_iso = (mapping_iteration is None) or (mapping_iteration % 5 == 0)
             
-            # Prepare data
-            means = params['means3D']  # [N, 3]
-            opacities = torch.sigmoid(params['logit_opacities'])  # [N, 1]
-            
-            # Build rotation matrices from quaternions
-            quats = F.normalize(params['unnorm_rotations'])  # [N, 4]
-            R = build_rotation(quats)  # [N, 3, 3]
-            
-            # Build scaling matrices (diagonal)
-            # scales is already [N, 3] and clamped, represents [s_x, s_y, s_z] for each Gaussian
-            # Covariance matrix: Σ = R S S^T R^T, where S = diag([s_x, s_y, s_z])
-            # Since S is diagonal: S S^T = S^2 = diag([s_x^2, s_y^2, s_z^2])
-            # Inverse: Σ^{-1} = R (S S^T)^{-1} R^T = R S^{-2} R^T
-            
-            # Compute S^{-2} = diag([1/s_x^2, 1/s_y^2, 1/s_z^2])
-            S_inv_sq = 1.0 / (scales ** 2 + 1e-8)  # [N, 3], add small epsilon for numerical stability
-            S_inv_sq_diag = torch.diag_embed(S_inv_sq)  # [N, 3, 3] - diagonal matrices
-            
-            # Compute Σ^{-1} = R S^{-2} R^T using batch matrix multiplication
-            # Step 1: R @ S^{-2}: [N, 3, 3] @ [N, 3, 3] = [N, 3, 3]
-            R_S_inv_sq = torch.bmm(R, S_inv_sq_diag)  # [N, 3, 3]
-            # Step 2: (R @ S^{-2}) @ R^T: [N, 3, 3] @ [N, 3, 3] = [N, 3, 3]
-            inverse_covariances = torch.bmm(R_S_inv_sq, R.transpose(1, 2))  # [N, 3, 3]
-            
-            # [IsoGS] Stochastic Sampling: Randomly sample query points each iteration
-            # This ensures coverage over multiple iterations while keeping memory usage bounded
-            num_gaussians = means.shape[0]
-            if num_gaussians >= sample_size:
-                # Random sample indices (re-sampled every iteration for better coverage)
-                sample_indices = torch.randperm(num_gaussians, device=means.device)[:sample_size]
-                query_points = means[sample_indices]  # [sample_size, 3]
+            if should_compute_iso:
+                # Parameters
+                target_saturation = 1.0
+                sample_size = 1024  # [IsoGS] Reduced from 8192 to 1024 for faster computation and lower memory usage
+                K = 16
+                
+                # Prepare data
+                means = params['means3D']  # [N, 3]
+                opacities = torch.sigmoid(params['logit_opacities'])  # [N, 1]
+                
+                # Build rotation matrices from quaternions
+                quats = F.normalize(params['unnorm_rotations'])  # [N, 4]
+                R = build_rotation(quats)  # [N, 3, 3]
+                
+                # Build scaling matrices (diagonal)
+                # scales is already [N, 3] and clamped, represents [s_x, s_y, s_z] for each Gaussian
+                # Covariance matrix: Σ = R S S^T R^T, where S = diag([s_x, s_y, s_z])
+                # Since S is diagonal: S S^T = S^2 = diag([s_x^2, s_y^2, s_z^2])
+                # Inverse: Σ^{-1} = R (S S^T)^{-1} R^T = R S^{-2} R^T
+                
+                # Compute S^{-2} = diag([1/s_x^2, 1/s_y^2, 1/s_z^2])
+                S_inv_sq = 1.0 / (scales ** 2 + 1e-8)  # [N, 3], add small epsilon for numerical stability
+                S_inv_sq_diag = torch.diag_embed(S_inv_sq)  # [N, 3, 3] - diagonal matrices
+                
+                # Compute Σ^{-1} = R S^{-2} R^T using batch matrix multiplication
+                # Step 1: R @ S^{-2}: [N, 3, 3] @ [N, 3, 3] = [N, 3, 3]
+                R_S_inv_sq = torch.bmm(R, S_inv_sq_diag)  # [N, 3, 3]
+                # Step 2: (R @ S^{-2}) @ R^T: [N, 3, 3] @ [N, 3, 3] = [N, 3, 3]
+                inverse_covariances = torch.bmm(R_S_inv_sq, R.transpose(1, 2))  # [N, 3, 3]
+                
+                # [IsoGS] Stochastic Sampling: Randomly sample query points each iteration
+                # This ensures coverage over multiple iterations while keeping memory usage bounded
+                num_gaussians = means.shape[0]
+                if num_gaussians >= sample_size:
+                    # Random sample indices (re-sampled every iteration for better coverage)
+                    sample_indices = torch.randperm(num_gaussians, device=means.device)[:sample_size]
+                    query_points = means[sample_indices]  # [sample_size, 3]
+                else:
+                    # If we have fewer Gaussians than sample_size, use all
+                    query_points = means  # [num_gaussians, 3]
+                    sample_size = num_gaussians
+                
+                # [IsoGS] Use optimized function with internal batching for density computation
+                # This function handles KNN search and density calculation efficiently with chunking to avoid OOM
+                loss_iso, density_val = compute_iso_surface_loss_sampled(
+                    query_points=query_points,
+                    means=means,
+                    inverse_covariances=inverse_covariances,
+                    opacities=opacities,
+                    K=K,
+                    target_saturation=target_saturation,
+                    chunk_size=128,  # Hard-coded internal batch size to strictly control memory usage
+                )
+                
+                losses['iso'] = loss_iso
+                
+                # Store mean density for monitoring (as a scalar tensor, not part of loss computation)
+                losses['mean_density'] = torch.tensor(density_val.mean().item(), device=density_val.device)
             else:
-                # If we have fewer Gaussians than sample_size, use all
-                query_points = means  # [num_gaussians, 3]
-                sample_size = num_gaussians
-            
-            # [IsoGS] Use optimized function with internal batching for density computation
-            # This function handles KNN search and density calculation efficiently with chunking to avoid OOM
-            loss_iso, density_val = compute_iso_surface_loss_sampled(
-                query_points=query_points,
-                means=means,
-                inverse_covariances=inverse_covariances,
-                opacities=opacities,
-                K=K,
-                target_saturation=target_saturation,
-                chunk_size=128,  # Hard-coded internal batch size to strictly control memory usage
-            )
-            
-            losses['iso'] = loss_iso
-            
-            # Store mean density for monitoring (as a scalar tensor, not part of loss computation)
-            losses['mean_density'] = torch.tensor(density_val.mean().item(), device=density_val.device)
+                # Skip Iso Loss computation for this iteration to save computation and memory
+                losses['iso'] = torch.tensor(0.0, device=scales.device, dtype=scales.dtype)
+                losses['mean_density'] = torch.tensor(0.0, device=scales.device, dtype=scales.dtype)
         else:
             # Skip for isotropic Gaussians
             losses['iso'] = torch.tensor(0.0, device=scales.device, dtype=scales.dtype)
@@ -1439,6 +1448,7 @@ def rgbd_slam(config: dict):
                     config['mapping']['use_l1'],
                     config['mapping']['ignore_outlier_depth_loss'],
                     mapping=True,
+                    mapping_iteration=iter,  # [IsoGS] Pass iteration number for conditional Iso Loss computation
                 )
                 # [IsoGS] Report loss regardless of wandb status
                 if config['use_wandb']:
