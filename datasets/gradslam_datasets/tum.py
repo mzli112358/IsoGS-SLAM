@@ -28,6 +28,7 @@ class TUMDataset(GradSLAMDataset):
     ):
         self.input_folder = os.path.join(basedir, sequence)
         self.pose_path = None
+        self.depth_txt = kwargs.pop("depth_txt", "depth.txt")
         super().__init__(
             config_dict,
             stride=stride,
@@ -44,7 +45,7 @@ class TUMDataset(GradSLAMDataset):
     def parse_list(self, filepath, skiprows=0):
         """ read list data """
         data = np.loadtxt(filepath, delimiter=' ',
-                          dtype=np.unicode_, skiprows=skiprows)
+                          dtype=np.str_, skiprows=skiprows)
         return data
 
     def associate_frames(self, tstamp_image, tstamp_depth, tstamp_pose, max_dt=0.08):
@@ -85,7 +86,7 @@ class TUMDataset(GradSLAMDataset):
             pose_list = os.path.join(self.input_folder, 'pose.txt')
 
         image_list = os.path.join(self.input_folder, 'rgb.txt')
-        depth_list = os.path.join(self.input_folder, 'depth.txt')
+        depth_list = os.path.join(self.input_folder, self.depth_txt)
 
         image_data = self.parse_list(image_list)
         depth_data = self.parse_list(depth_list)
@@ -125,7 +126,7 @@ class TUMDataset(GradSLAMDataset):
             pose_list = os.path.join(self.input_folder, 'pose.txt')
 
         image_list = os.path.join(self.input_folder, 'rgb.txt')
-        depth_list = os.path.join(self.input_folder, 'depth.txt')
+        depth_list = os.path.join(self.input_folder, self.depth_txt)
 
         image_data = self.parse_list(image_list)
         depth_data = self.parse_list(depth_list)

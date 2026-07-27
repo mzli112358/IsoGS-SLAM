@@ -6,8 +6,8 @@ primary_device = "cuda:0"
 scenes = ["scene0000_00", "scene0059_00", "scene0106_00", 
           "scene0169_00", "scene0181_00", "scene0207_00"]
 
-seed = int(6)
-scene_name = scenes[int(6)]
+seed = int(0)
+scene_name = scenes[int(0)]
 
 map_every = 1
 keyframe_every = 5
@@ -35,9 +35,9 @@ config = dict(
     report_iter_progress=False,
     load_checkpoint=False,
     checkpoint_time_idx=0,
-    save_checkpoints=False, # Save Checkpoints
+    save_checkpoints=True, # Save Checkpoints
     checkpoint_interval=100, # Checkpoint Interval
-    use_wandb=True,
+    use_wandb=False,
     wandb=dict(
         entity="theairlab",
         project="SplaTAM",

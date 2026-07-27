@@ -12,14 +12,22 @@ def torch_3d_knn(pts, num_knn, method="l2"):
     else:
         raise NotImplementedError(f"Method: {method}")
 
-    # Convert FAISS index to GPU
-    if pts.get_device() != -1:
-        res = faiss.StandardGpuResources()
-        index = faiss.index_cpu_to_gpu(res, 0, index)
+    use_gpu = False
+    if pts.get_device() != -1 and hasattr(faiss, "StandardGpuResources"):
+        try:
+            res = faiss.StandardGpuResources()
+            index = faiss.index_cpu_to_gpu(res, 0, index)
+            use_gpu = True
+        except Exception:
+            use_gpu = False
 
-    # Add points to index and compute distances
-    index.add(pts)
-    distances, indices = index.search(pts, num_knn)
+    # CPU FAISS cannot take CUDA tensors; keep results on the original device.
+    pts_in = pts if use_gpu else pts.detach().cpu()
+    index.add(pts_in)
+    distances, indices = index.search(pts_in, num_knn)
+    if (not use_gpu) and pts.get_device() != -1:
+        distances = distances.to(pts.device)
+        indices = indices.to(pts.device)
     return distances, indices
     
 

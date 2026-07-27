@@ -934,6 +934,7 @@ def rgbd_slam(config: dict):
         dataset_config["ignore_bad"] = False
     if "use_train_split" not in dataset_config:
         dataset_config["use_train_split"] = True
+    depth_txt = dataset_config.get("depth_txt", "depth.txt")
     if "densification_image_height" not in dataset_config:
         dataset_config["densification_image_height"] = dataset_config["desired_image_height"]
         dataset_config["densification_image_width"] = dataset_config["desired_image_width"]
@@ -968,6 +969,7 @@ def rgbd_slam(config: dict):
         relative_pose=True,
         ignore_bad=dataset_config["ignore_bad"],
         use_train_split=dataset_config["use_train_split"],
+        depth_txt=depth_txt,
     )
     num_frames = dataset_config["num_frames"]
     if num_frames == -1:
@@ -991,6 +993,7 @@ def rgbd_slam(config: dict):
             relative_pose=True,
             ignore_bad=dataset_config["ignore_bad"],
             use_train_split=dataset_config["use_train_split"],
+            depth_txt=depth_txt,
         )
         # Initialize Parameters, Canonical & Densification Camera parameters
         params, variables, intrinsics, first_frame_w2c, cam, \
@@ -1021,6 +1024,7 @@ def rgbd_slam(config: dict):
             relative_pose=True,
             ignore_bad=dataset_config["ignore_bad"],
             use_train_split=dataset_config["use_train_split"],
+            depth_txt=depth_txt,
         )
         tracking_color, _, tracking_intrinsics, _ = tracking_dataset[0]
         tracking_color = tracking_color.permute(2, 0, 1) / 255 # (H, W, C) -> (C, H, W)

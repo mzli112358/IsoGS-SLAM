@@ -24,7 +24,7 @@ config = dict(
     ),
     data=dict(
         basedir="./data/Replica",
-        gradslam_data_cfg="./data/replica.yaml",
+        gradslam_data_cfg="./configs/data/replica.yaml",
         sequence="room0",
         desired_image_height=680,
         desired_image_width=1200,
